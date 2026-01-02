@@ -14,6 +14,13 @@ from validators import (
     extract_location, extract_property_type, calculate_lead_score
 )
 
+# Import database functions
+from database import (
+    init_database, save_message_to_db, get_conversation_history_from_db,
+    save_conversation_state_to_db, get_conversation_state_from_db,
+    get_all_leads_from_db, get_database_stats
+)
+
 load_dotenv()
 
 app = FastAPI()
@@ -21,9 +28,8 @@ app = FastAPI()
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# In-memory storage (replace with database for production)
-conversations = {}
-conversation_states = {}
+# Initialize database on startup
+init_database()
 
 # Enhanced system prompt for natural, professional sales conversations
 SYSTEM_PROMPT = """You are Aisha, a warm and professional real estate consultant for a premium Dubai-based real estate company. You're having a natural WhatsApp conversation with a potential client.
@@ -109,8 +115,12 @@ Remember: You're not a form-filling robot. You're a skilled sales professional h
 
 def get_conversation_state(phone_number: str) -> Dict:
     """Get or create conversation state for a phone number"""
-    if phone_number not in conversation_states:
-        conversation_states[phone_number] = {
+    # Try to get from database first
+    state = get_conversation_state_from_db(phone_number)
+    
+    if state is None:
+        # Create new state if doesn't exist
+        state = {
             "stage": "greeting",  # greeting, qualifying, scheduling, completed
             "lead_data": {
                 "name": None,
@@ -126,30 +136,27 @@ def get_conversation_state(phone_number: str) -> Dict:
             "last_activity": datetime.now().isoformat(),
             "message_count": 0
         }
-    return conversation_states[phone_number]
+        # Save to database
+        save_conversation_state_to_db(phone_number, state)
+    
+    return state
 
 def update_conversation_state(phone_number: str, updates: Dict):
     """Update conversation state"""
     state = get_conversation_state(phone_number)
     state.update(updates)
     state["last_activity"] = datetime.now().isoformat()
-    conversation_states[phone_number] = state
+    # Save to database
+    save_conversation_state_to_db(phone_number, state)
 
 def get_conversation_history(phone_number: str, limit: int = 10):
     """Get recent conversation history for a phone number"""
-    if phone_number not in conversations:
-        conversations[phone_number] = []
-    return conversations[phone_number][-limit:]
+    return get_conversation_history_from_db(phone_number, limit)
 
 def save_message(phone_number: str, role: str, content: str):
     """Save a message to conversation history"""
-    if phone_number not in conversations:
-        conversations[phone_number] = []
-    conversations[phone_number].append({
-        "role": role, 
-        "content": content,
-        "timestamp": datetime.now().isoformat()
-    })
+    timestamp = datetime.now().isoformat()
+    save_message_to_db(phone_number, role, content, timestamp)
 
 def process_user_input(phone_number: str, user_message: str) -> Dict:
     """
@@ -346,12 +353,23 @@ async def root():
     return {
         "status": "Professional WhatsApp Sales Agent is running",
         "model": "GPT-4o",
+        "storage": "SQLite Database",
         "features": [
             "Natural conversation flow",
             "Input validation (phone, email, budget)",
             "Lead qualification & scoring",
-            "Intelligent retry logic"
+            "Intelligent retry logic",
+            "Persistent storage (survives restarts)"
         ]
+    }
+
+@app.get("/stats")
+async def get_stats():
+    """Get database statistics"""
+    stats = get_database_stats()
+    return {
+        "status": "active",
+        "database": stats
     }
 
 @app.get("/conversations/{phone_number}")
@@ -370,21 +388,7 @@ async def get_conversation(phone_number: str):
 @app.get("/leads")
 async def get_all_leads():
     """Get all leads with their scores (for dashboard/CRM integration)"""
-    leads = []
-    for phone, state in conversation_states.items():
-        if state["lead_score"] > 0:
-            leads.append({
-                "phone": phone,
-                "score": state["lead_score"],
-                "stage": state["stage"],
-                "data": state["lead_data"],
-                "last_activity": state["last_activity"],
-                "message_count": state["message_count"]
-            })
-    
-    # Sort by lead score (highest first)
-    leads.sort(key=lambda x: x["score"], reverse=True)
-    
+    leads = get_all_leads_from_db()
     return {"total_leads": len(leads), "leads": leads}
 
 @app.get("/leads/export")
@@ -402,29 +406,31 @@ async def export_leads_csv():
         'Lead Score', 'Stage', 'Message Count', 'Last Activity'
     ])
     
+    # Get leads from database
+    leads = get_all_leads_from_db()
+    
     # Write data
-    for phone, state in conversation_states.items():
-        if state["lead_score"] > 0:
-            data = state["lead_data"]
-            budget_str = ""
-            if data.get("budget"):
-                if data["budget"].get("type") == "range":
-                    budget_str = f"{data['budget']['min']}-{data['budget']['max']} AED"
-                else:
-                    budget_str = f"{data['budget']['value']} AED"
-            
-            writer.writerow([
-                phone,
-                data.get('name', ''),
-                data.get('email', ''),
-                budget_str,
-                data.get('location_preference', ''),
-                data.get('property_type', ''),
-                state['lead_score'],
-                state['stage'],
-                state['message_count'],
-                state['last_activity']
-            ])
+    for lead in leads:
+        data = lead["data"]
+        budget_str = ""
+        if data.get("budget"):
+            if data["budget"].get("type") == "range":
+                budget_str = f"{data['budget']['min']}-{data['budget']['max']} AED"
+            else:
+                budget_str = f"{data['budget']['value']} AED"
+        
+        writer.writerow([
+            lead["phone"],
+            data.get('name', ''),
+            data.get('email', ''),
+            budget_str,
+            data.get('location_preference', ''),
+            data.get('property_type', ''),
+            lead['score'],
+            lead['stage'],
+            lead['message_count'],
+            lead['last_activity']
+        ])
     
     from fastapi.responses import StreamingResponse
     output.seek(0)
