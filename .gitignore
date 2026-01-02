@@ -2,6 +2,9 @@
 .env
 venv/
 
+# Database
+whatsapp_agent.db
+
 # Python
 __pycache__/
 *.py[cod]
